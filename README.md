@@ -3,7 +3,7 @@
 🔗 **Live Demo:** https://sagarlamon.github.io/zapdrop/
 
 **Version:** 2.0.0  
-**Author:** Sagar  
+**Author:** SAGAR  
 **Type:** Serverless Web Application  
 
 ZapDrop is a peer-to-peer file transfer web app inspired by Apple AirDrop, but it works **entirely in the browser**. No backend servers are involved in file transfers.
