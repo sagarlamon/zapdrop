@@ -12,21 +12,40 @@ import {
   X,
   Volume2,
   VolumeX,
-  Zap
+  Zap,
+  Camera,
+  Archive,
+  History,
+  Trash2
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { playSound } from './utils/sounds';
+import JSZip from 'jszip';
+import QrScanner from './components/QrScanner';
 
 interface FileTransferState {
   file: File;
   progress: number;
   status: 'pending' | 'sending' | 'complete' | 'error';
+  bytesTransferred?: number;
+  speed?: string;
+  eta?: string;
 }
 
-interface ReceivedFile {
+interface ReceivedFileState {
+  id: string;
   blob: Blob;
   name: string;
   type: string;
+  objectUrl: string;
+}
+
+interface HistoryLogItem {
+  id: string;
+  name: string;
+  size: number;
+  type: 'sent' | 'received';
+  timestamp: number;
 }
 
 interface Toast {
@@ -41,14 +60,22 @@ export default function App() {
   const [remoteId, setRemoteId] = useState('');
   const [copied, setCopied] = useState(false);
   const [files, setFiles] = useState<FileTransferState[]>([]);
-  const [receivedFile, setReceivedFile] = useState<ReceivedFile | null>(null);
+  const [receivedFiles, setReceivedFiles] = useState<ReceivedFileState[]>([]);
+  const [receivingMetadata, setReceivingMetadata] = useState<{ name: string; size: number } | null>(null);
   const [receiveProgress, setReceiveProgress] = useState(0);
+  const [receiveSpeed, setReceiveSpeed] = useState('');
+  const [receiveEta, setReceiveEta] = useState('');
   const [isReceiving, setIsReceiving] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [showScanner, setShowScanner] = useState(false);
+  const [historyLogs, setHistoryLogs] = useState<HistoryLogItem[]>([]);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
   const receiverRef = useRef<FileReceiver | null>(null);
+  const sendingRef = useRef(false);
+  const receiveStartRef = useRef<number | null>(null);
 
   const showToast = useCallback((message: string, type: Toast['type'] = 'info') => {
     const id = Math.random().toString(36).slice(2);
@@ -92,45 +119,233 @@ export default function App() {
     }
   }, [status, soundEnabled, showToast]);
 
-  // File receiving
+  // Register Service Worker for PWA offline support
+  useEffect(() => {
+    if ('serviceWorker' in navigator && import.meta.env.PROD) {
+      navigator.serviceWorker.register('./sw.js')
+        .then(reg => console.log('SW registered successfully:', reg.scope))
+        .catch(err => console.error('SW registration failed:', err));
+    }
+  }, []);
+
+  // Load history logs on mount
+  useEffect(() => {
+    const stored = localStorage.getItem('zapdrop_history');
+    if (stored) {
+      try {
+        setHistoryLogs(JSON.parse(stored));
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  }, []);
+
+  const addToHistory = useCallback((name: string, size: number, type: 'sent' | 'received') => {
+    const newItem: HistoryLogItem = {
+      id: Math.random().toString(36).slice(2),
+      name,
+      size,
+      type,
+      timestamp: Date.now()
+    };
+    setHistoryLogs(prev => {
+      const updated = [newItem, ...prev].slice(0, 50);
+      localStorage.setItem('zapdrop_history', JSON.stringify(updated));
+      return updated;
+    });
+  }, []);
+
+  const clearHistory = () => {
+    setHistoryLogs([]);
+    localStorage.removeItem('zapdrop_history');
+    showToast('History cleared', 'info');
+  };
+
+  const formatSpeed = useCallback((bytesPerSecond: number) => {
+    if (bytesPerSecond < 1024) return `${bytesPerSecond.toFixed(1)} B/s`;
+    if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+    return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+  }, []);
+
+  // Recursive Directory Traversal for folder zipping
+  const traverseDirectory = async (entry: any, zip: JSZip, path = '') => {
+    if (entry.isFile) {
+      const file = await new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+      zip.file(`${path}${entry.name}`, file);
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader();
+      const entries = await new Promise<any[]>((resolve) => {
+        const result: any[] = [];
+        const read = () => {
+          dirReader.readEntries((newEntries: any[]) => {
+            if (newEntries.length === 0) {
+              resolve(result);
+            } else {
+              result.push(...newEntries);
+              read();
+            }
+          });
+        };
+        read();
+      });
+      for (const child of entries) {
+        await traverseDirectory(child, zip, `${path}${entry.name}/`);
+      }
+    }
+  };
+
+  // Refs for tracking values inside callbacks to avoid re-binding event listeners
+  const soundEnabledRef = useRef(soundEnabled);
+  const receiveSizeRef = useRef<number>(0);
+
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+  }, [soundEnabled]);
+
+  // File receiving listener
   useEffect(() => {
     if (!connection) return;
 
-    receiverRef.current = new FileReceiver(connection);
+    // Reset any existing listener on connection to avoid duplication
+    try {
+      (connection as any).off('data');
+    } catch (e) {
+      console.warn('Failed to cleanup old listeners:', e);
+    }
+
+    const receiver = new FileReceiver(connection);
+    receiverRef.current = receiver;
     
-    receiverRef.current.onStart = () => {
+    receiver.onStart = (fileName, fileSize) => {
       setIsReceiving(true);
       setReceiveProgress(0);
-      setReceivedFile(null);
+      setReceiveSpeed('');
+      setReceiveEta('estimating...');
+      setReceivingMetadata({ name: fileName, size: fileSize });
+      receiveStartRef.current = Date.now();
+      receiveSizeRef.current = fileSize;
     };
 
-    receiverRef.current.onProgress = (progress) => {
+    receiver.onProgress = (progress, bytesTransferred) => {
+      const elapsed = (Date.now() - (receiveStartRef.current ?? Date.now())) / 1000;
+      const speedBps = elapsed > 0 ? bytesTransferred / elapsed : 0;
+      const speedText = formatSpeed(speedBps);
+      const remainingBytes = receiveSizeRef.current - bytesTransferred;
+      const etaSeconds = speedBps > 0 ? Math.ceil(remainingBytes / speedBps) : 0;
+      const etaText = speedBps > 0 ? `${etaSeconds}s remaining` : 'estimating...';
+
       setReceiveProgress(progress);
+      setReceiveSpeed(speedText);
+      setReceiveEta(etaText);
     };
 
-    receiverRef.current.onComplete = (blob, fileName, fileType) => {
-      setReceivedFile({ blob, name: fileName, type: fileType });
+    receiver.onComplete = (blob, fileName, fileType) => {
+      const objectUrl = URL.createObjectURL(blob);
+      const newFile: ReceivedFileState = {
+        id: Math.random().toString(36).slice(2),
+        blob,
+        name: fileName,
+        type: fileType,
+        objectUrl
+      };
+      setReceivedFiles(prev => [...prev, newFile]);
       setIsReceiving(false);
-      if (soundEnabled) playSound('complete');
+      setReceivingMetadata(null);
+      if (soundEnabledRef.current) playSound('complete');
       showToast(`Received: ${fileName}`, 'success');
+      addToHistory(fileName, blob.size, 'received');
+
+      // Auto-download file
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = fileName;
+      a.click();
     };
 
-    receiverRef.current.onError = (err) => {
+    receiver.onError = (err) => {
       console.error('Receive error:', err);
       setIsReceiving(false);
-      if (soundEnabled) playSound('error');
+      setReceivingMetadata(null);
+      if (soundEnabledRef.current) playSound('error');
       showToast('Transfer failed', 'error');
     };
 
     return () => {
       receiverRef.current = null;
+      try {
+        (connection as any).off('data');
+      } catch (e) {
+        console.warn('Failed to cleanup on unmount:', e);
+      }
     };
-  }, [connection, soundEnabled, showToast]);
+  }, [connection, showToast, addToHistory, formatSpeed]);
 
-  // Send files
-  const sendFiles = useCallback(async (fileList: File[]) => {
-    if (!connection) return;
+  // Cleanup object URLs on unmount
+  useEffect(() => {
+    return () => {
+      receivedFiles.forEach(f => URL.revokeObjectURL(f.objectUrl));
+    };
+  }, [receivedFiles]);
 
+  // Sequentially send pending files
+  useEffect(() => {
+    if (!connection || sendingRef.current) return;
+
+    const nextIndex = files.findIndex(f => f.status === 'pending');
+    if (nextIndex === -1) return;
+
+    sendingRef.current = true;
+    const fileTransfer = files[nextIndex];
+    const startTime = Date.now();
+
+    setFiles(prev => prev.map((f, idx) => 
+      idx === nextIndex ? { ...f, status: 'sending' } : f
+    ));
+
+    const sender = new FileSender(connection, fileTransfer.file);
+    sender.onProgress = (progress, bytesTransferred) => {
+      const elapsed = (Date.now() - startTime) / 1000;
+      const speedBps = elapsed > 0 ? bytesTransferred / elapsed : 0;
+      const speedText = formatSpeed(speedBps);
+      const remainingBytes = fileTransfer.file.size - bytesTransferred;
+      const etaSeconds = speedBps > 0 ? Math.ceil(remainingBytes / speedBps) : 0;
+      const etaText = speedBps > 0 ? `${etaSeconds}s remaining` : 'estimating...';
+
+      setFiles(prev => prev.map((f, idx) => 
+        idx === nextIndex ? { 
+          ...f, 
+          progress, 
+          bytesTransferred, 
+          speed: speedText, 
+          eta: etaText 
+        } : f
+      ));
+    };
+
+    sender.send()
+      .then(() => {
+        setFiles(prev => prev.map((f, idx) => 
+          idx === nextIndex ? { ...f, status: 'complete', progress: 100 } : f
+        ));
+        if (soundEnabledRef.current) playSound('complete');
+        showToast(`Sent: ${fileTransfer.file.name}`, 'success');
+        addToHistory(fileTransfer.file.name, fileTransfer.file.size, 'sent');
+      })
+      .catch((err) => {
+        console.error('Send error:', err);
+        setFiles(prev => prev.map((f, idx) => 
+          idx === nextIndex ? { ...f, status: 'error' } : f
+        ));
+        if (soundEnabledRef.current) playSound('error');
+        showToast(`Failed to send: ${fileTransfer.file.name}`, 'error');
+      })
+      .finally(() => {
+        sendingRef.current = false;
+      });
+  }, [connection, files, showToast, addToHistory, formatSpeed]);
+
+  // Send files trigger (adds files to queue)
+  const sendFiles = useCallback((fileList: File[]) => {
     const newFiles = fileList.map(f => ({
       file: f,
       progress: 0,
@@ -138,47 +353,46 @@ export default function App() {
     }));
 
     setFiles(prev => [...prev, ...newFiles]);
+    if (soundEnabled) playSound('click');
+  }, [soundEnabled]);
 
-    for (let i = 0; i < fileList.length; i++) {
-      const file = fileList[i];
-      const fileIndex = files.length + i;
-
-      setFiles(prev => prev.map((f, idx) => 
-        idx === fileIndex ? { ...f, status: 'sending' } : f
-      ));
-
-      try {
-        const sender = new FileSender(connection, file);
-        sender.onProgress = (progress) => {
-          setFiles(prev => prev.map((f, idx) => 
-            idx === fileIndex ? { ...f, progress } : f
-          ));
-        };
-
-        await sender.send();
-        
-        setFiles(prev => prev.map((f, idx) => 
-          idx === fileIndex ? { ...f, status: 'complete', progress: 100 } : f
-        ));
-
-        if (soundEnabled) playSound('complete');
-        showToast(`Sent: ${file.name}`, 'success');
-      } catch (err) {
-        setFiles(prev => prev.map((f, idx) => 
-          idx === fileIndex ? { ...f, status: 'error' } : f
-        ));
-        if (soundEnabled) playSound('error');
-        showToast(`Failed to send: ${file.name}`, 'error');
-      }
-    }
-  }, [connection, files.length, soundEnabled, showToast]);
-
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    const droppedFiles = Array.from(e.dataTransfer.files);
-    if (droppedFiles.length > 0) sendFiles(droppedFiles);
-  }, [sendFiles]);
+
+    const items = Array.from(e.dataTransfer.items || []);
+    const filesToProcess: File[] = [];
+    const foldersToZip: any[] = [];
+
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const entry = item.webkitGetAsEntry();
+        if (entry) {
+          if (entry.isDirectory) {
+            foldersToZip.push(entry);
+          } else {
+            const file = item.getAsFile();
+            if (file) filesToProcess.push(file);
+          }
+        }
+      }
+    }
+
+    if (foldersToZip.length > 0) {
+      showToast('Zipping folder(s)...', 'info');
+      for (const folder of foldersToZip) {
+        const zip = new JSZip();
+        await traverseDirectory(folder, zip);
+        const content = await zip.generateAsync({ type: 'blob' });
+        const zippedFile = new File([content], `${folder.name}.zip`, { type: 'application/zip' });
+        filesToProcess.push(zippedFile);
+      }
+    }
+
+    if (filesToProcess.length > 0) {
+      sendFiles(filesToProcess);
+    }
+  }, [sendFiles, showToast]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || []);
@@ -186,15 +400,42 @@ export default function App() {
     e.target.value = '';
   };
 
-  const downloadFile = () => {
-    if (!receivedFile) return;
-    const url = URL.createObjectURL(receivedFile.blob);
+  const downloadFile = (file: ReceivedFileState) => {
+    const a = document.createElement('a');
+    a.href = file.objectUrl;
+    a.download = file.name;
+    a.click();
+    if (soundEnabled) playSound('click');
+  };
+
+  const downloadAllAsZip = async () => {
+    if (receivedFiles.length === 0) return;
+    showToast('Creating zip bundle...', 'info');
+    if (soundEnabled) playSound('click');
+
+    const zip = new JSZip();
+    receivedFiles.forEach(rf => {
+      zip.file(rf.name, rf.blob);
+    });
+
+    const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
     const a = document.createElement('a');
     a.href = url;
-    a.download = receivedFile.name;
+    a.download = `zapdrop-bundle-${Date.now().toString().slice(-4)}.zip`;
     a.click();
     URL.revokeObjectURL(url);
-    if (soundEnabled) playSound('click');
+    showToast('Zip downloaded!', 'success');
+  };
+
+  const removeReceivedFile = (id: string) => {
+    setReceivedFiles(prev => {
+      const target = prev.find(f => f.id === id);
+      if (target) {
+        URL.revokeObjectURL(target.objectUrl);
+      }
+      return prev.filter(f => f.id !== id);
+    });
   };
 
   const formatSize = (bytes: number) => {
@@ -235,6 +476,7 @@ export default function App() {
         <div className="flex items-center gap-2">
           <Zap size={20} style={{ color: 'var(--text-primary)' }} />
           <span className="font-medium tracking-tight">ZapDrop</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded font-mono border" style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)' }}>v2.0.0</span>
         </div>
         
         <div className="flex items-center gap-4">
@@ -357,6 +599,14 @@ export default function App() {
                     }}
                   />
                   <button
+                    onClick={() => setShowScanner(true)}
+                    className="p-2 transition-opacity hover:opacity-60"
+                    style={{ color: 'var(--text-secondary)' }}
+                    title="Scan QR Code"
+                  >
+                    <Camera size={18} />
+                  </button>
+                  <button
                     onClick={handleConnect}
                     disabled={!remoteId.trim() || status === 'connecting'}
                     className="p-2 transition-opacity hover:opacity-60 disabled:opacity-30"
@@ -424,6 +674,12 @@ export default function App() {
                               {f.status === 'complete' ? '✓' : `${f.progress}%`}
                             </span>
                           </div>
+                          {f.status === 'sending' && f.speed && (
+                            <div className="flex justify-between text-[10px] mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                              <span>{f.speed}</span>
+                              <span>{f.eta}</span>
+                            </div>
+                          )}
                         </div>
                         {f.status === 'pending' && (
                           <button
@@ -441,10 +697,10 @@ export default function App() {
               )}
 
               {/* Receiving File */}
-              {isReceiving && (
+              {isReceiving && receivingMetadata && (
                 <div className="mb-8">
-                  <label className="text-xs uppercase tracking-wider mb-3 block" style={{ color: 'var(--text-muted)' }}>
-                    Receiving
+                  <label className="text-xs uppercase tracking-wider mb-3 block truncate" style={{ color: 'var(--text-muted)' }}>
+                    Receiving: {receivingMetadata.name} ({formatSize(receivingMetadata.size)})
                   </label>
                   <div className="flex items-center gap-2">
                     <div className="flex-1 h-1" style={{ background: 'var(--border)' }}>
@@ -457,47 +713,80 @@ export default function App() {
                       {receiveProgress}%
                     </span>
                   </div>
+                  {receiveSpeed && (
+                    <div className="flex justify-between text-[10px] mt-0.5 px-1" style={{ color: 'var(--text-secondary)' }}>
+                      <span>{receiveSpeed}</span>
+                      <span>{receiveEta}</span>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {/* Received File */}
-              {receivedFile && (
+              {/* Received Files */}
+              {receivedFiles.length > 0 && (
                 <div className="mb-8">
-                  <label className="text-xs uppercase tracking-wider mb-3 block" style={{ color: 'var(--text-muted)' }}>
-                    Received
-                  </label>
-                  <div className="flex items-center justify-between">
-                    <div className="min-w-0">
-                      <p className="text-sm truncate" style={{ color: 'var(--text-primary)' }}>
-                        {receivedFile.name}
-                      </p>
-                      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-                        {formatSize(receivedFile.blob.size)}
-                      </p>
-                    </div>
-                    <button
-                      onClick={downloadFile}
-                      className="flex items-center gap-2 px-4 py-2 text-sm transition-opacity hover:opacity-70"
-                      style={{ 
-                        background: 'var(--text-primary)',
-                        color: 'var(--bg-primary)'
-                      }}
-                    >
-                      <Download size={14} />
-                      Download
-                    </button>
+                  <div className="flex justify-between items-center mb-3">
+                    <label className="text-xs uppercase tracking-wider block" style={{ color: 'var(--text-muted)' }}>
+                      Received Files
+                    </label>
+                    {receivedFiles.length > 1 && (
+                      <button
+                        onClick={downloadAllAsZip}
+                        className="text-xs flex items-center gap-1.5 px-2.5 py-1 rounded border transition-colors hover:bg-[var(--bg-secondary)]"
+                        style={{ borderColor: 'var(--border)', color: 'var(--text-primary)' }}
+                      >
+                        <Archive size={12} />
+                        Download All (Zip)
+                      </button>
+                    )}
                   </div>
-                  
-                  {/* Image Preview */}
-                  {receivedFile.type.startsWith('image/') && (
-                    <div className="mt-4">
-                      <img 
-                        src={URL.createObjectURL(receivedFile.blob)} 
-                        alt={receivedFile.name}
-                        className="max-w-full max-h-48 object-contain"
-                      />
-                    </div>
-                  )}
+                  <div className="space-y-3">
+                    {receivedFiles.map((rf) => (
+                      <div key={rf.id} className="p-3 border rounded-lg" style={{ borderColor: 'var(--border)' }}>
+                        <div className="flex items-center justify-between">
+                          <div className="min-w-0 flex-1 mr-4">
+                            <p className="text-sm truncate font-medium" style={{ color: 'var(--text-primary)' }}>
+                              {rf.name}
+                            </p>
+                            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                              {formatSize(rf.blob.size)}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => downloadFile(rf)}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded transition-opacity hover:opacity-80"
+                              style={{ 
+                                background: 'var(--text-primary)',
+                                color: 'var(--bg-primary)'
+                              }}
+                            >
+                              <Download size={12} />
+                              Download
+                            </button>
+                            <button
+                              onClick={() => removeReceivedFile(rf.id)}
+                              className="p-1.5 hover:opacity-60"
+                              style={{ color: 'var(--text-muted)' }}
+                            >
+                              <X size={14} />
+                            </button>
+                          </div>
+                        </div>
+                        
+                        {/* Image Preview inside list item */}
+                        {rf.type.startsWith('image/') && (
+                          <div className="mt-3 overflow-hidden rounded border" style={{ borderColor: 'var(--border)' }}>
+                            <img 
+                              src={rf.objectUrl} 
+                              alt={rf.name}
+                              className="max-w-full max-h-32 object-contain mx-auto"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </>
@@ -505,9 +794,61 @@ export default function App() {
 
           {/* Error */}
           {error && (
-            <p className="text-sm" style={{ color: 'var(--error)' }}>
+            <p className="text-sm mt-4" style={{ color: 'var(--error)' }}>
               {error}
             </p>
+          )}
+
+          {/* History Log */}
+          {historyLogs.length > 0 && (
+            <div className="mt-8 border-t pt-8" style={{ borderColor: 'var(--border)' }}>
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2" style={{ color: 'var(--text-secondary)' }}>
+                  <History size={16} />
+                  <span className="text-xs uppercase tracking-wider font-semibold">Transfer History</span>
+                </div>
+                <button
+                  onClick={clearHistory}
+                  className="text-xs flex items-center gap-1 hover:opacity-75 transition-opacity"
+                  style={{ color: 'var(--error)' }}
+                >
+                  <Trash2 size={12} />
+                  Clear
+                </button>
+              </div>
+              <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                {historyLogs.map(log => (
+                  <div key={log.id} className="flex items-center justify-between text-xs py-2 border-b" style={{ borderColor: 'var(--border)' }}>
+                    <div className="min-w-0 flex-1 mr-2">
+                      <p className="truncate font-medium" style={{ color: 'var(--text-primary)' }}>
+                        {log.name}
+                      </p>
+                      <p style={{ color: 'var(--text-muted)' }}>
+                        {formatSize(log.size)} • {log.type === 'sent' ? 'Sent' : 'Received'} • {new Date(log.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                      </p>
+                    </div>
+                    <span 
+                      className="font-medium shrink-0 text-sm"
+                      style={{ color: log.type === 'sent' ? 'var(--text-secondary)' : 'var(--success)' }}
+                    >
+                      {log.type === 'sent' ? '📤' : '📥'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* QR Scanner Modal */}
+          {showScanner && (
+            <QrScanner 
+              onScan={(scannedId) => {
+                setRemoteId(scannedId);
+                setShowScanner(false);
+                connectToPeer(scannedId);
+              }}
+              onClose={() => setShowScanner(false)}
+            />
           )}
         </div>
       </main>

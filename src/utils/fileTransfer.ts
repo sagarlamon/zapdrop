@@ -25,7 +25,7 @@ type FileMessage = FileMetadata | FileChunk | FileComplete;
 export class FileSender {
   private connection: DataConnection;
   private file: File;
-  public onProgress: ((progress: number) => void) | null = null;
+  public onProgress: ((progress: number, bytesTransferred: number) => void) | null = null;
 
   constructor(connection: DataConnection, file: File) {
     this.connection = connection;
@@ -62,7 +62,7 @@ export class FileSender {
 
       const progress = Math.round(((i + 1) / totalChunks) * 100);
       if (this.onProgress) {
-        this.onProgress(progress);
+        this.onProgress(progress, end);
       }
 
       // Small delay to prevent overwhelming the connection
@@ -83,8 +83,8 @@ export class FileReceiver {
   private metadata: FileMetadata | null = null;
   private receivedChunks = 0;
 
-  public onStart: (() => void) | null = null;
-  public onProgress: ((progress: number) => void) | null = null;
+  public onStart: ((fileName: string, fileSize: number) => void) | null = null;
+  public onProgress: ((progress: number, bytesTransferred: number) => void) | null = null;
   public onComplete: ((blob: Blob, fileName: string, fileType: string) => void) | null = null;
   public onError: ((error: Error) => void) | null = null;
 
@@ -103,7 +103,7 @@ export class FileReceiver {
           this.chunks = new Array(message.totalChunks);
           this.receivedChunks = 0;
           if (this.onStart) {
-            this.onStart();
+            this.onStart(message.fileName, message.fileSize);
           }
         } else if (message.type === 'chunk' && this.metadata) {
           this.chunks[message.index] = message.data;
@@ -111,7 +111,8 @@ export class FileReceiver {
 
           const progress = Math.round((this.receivedChunks / this.metadata.totalChunks) * 100);
           if (this.onProgress) {
-            this.onProgress(progress);
+            const currentBytes = Math.min(this.receivedChunks * CHUNK_SIZE, this.metadata.fileSize);
+            this.onProgress(progress, currentBytes);
           }
         } else if (message.type === 'complete' && this.metadata) {
           const blob = new Blob(this.chunks, { type: this.metadata.fileType });
